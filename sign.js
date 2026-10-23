@@ -28,7 +28,9 @@ const zlib = require('zlib');
 const { URLSearchParams } = require('url');
 
 const BASE = 'https://bbs.binmt.cc';
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+// 沿用 Xingyan777 的移动端 UA：论坛对移动端返回更简单的页面，
+// 触发 WAF 挑战的概率明显低于桌面 UA，这也是他那套几秒就完成的原因之一
+const UA = 'Mozilla/5.0 (Linux; Android 11; SM-G975F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36';
 
 const REQ_TIMEOUT = 120000;
 const REQ_RETRIES = 4;
@@ -122,12 +124,13 @@ function solveAcwChallenge(html) {
   const m = html.match(/<script>([\s\S]*?)<\/script>/);
   if (!m) return null;
   const js = m[1];
-  if (!/arg1\s*=/.test(js)) return null;
+  // 与 Xingyan777 一致：先确认是含 arg1 的 acw 挑战脚本
+  if (!/arg1\s*=\s*'([0-9A-Fa-f]+)'/.test(js)) return null;
   let cookieVal = '';
   const sandbox = {
     document: {},
     location: { reload() {}, href: BASE + '/' },
-    navigator: { userAgent: UA, platform: 'Win32' },
+    navigator: { userAgent: UA, platform: 'Linux x86_64' },
     localStorage: { getItem: () => null, setItem: () => {} },
     Date, Math, RegExp, String, Array, Object, Number, Boolean,
     parseInt, parseFloat, isNaN, decodeURIComponent, encodeURIComponent,
@@ -254,7 +257,8 @@ async function attemptSign(user, pwd) {
     console.log(`ℹ️ 登录响应未知: ${lgText}`);
   }
   let cookie = lg.cookie;
-  const logged = /_saltkey|_|auth/.test(cookie) || /登录成功|欢迎您回来/.test(lg.res.body);
+  // Discuz 登录成功后 set-cookie 会带 saltkey / auth
+  const logged = /saltkey|auth/i.test(cookie) || /登录成功|欢迎您回来/.test(lg.res.body);
   if (!logged) {
     return { ok: false, msg: '登录未确认（未拿到会话 Cookie）' };
   }
