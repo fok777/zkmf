@@ -70,15 +70,17 @@ jobs:
           --jq '.workflow_runs[] | "\(.id) \(.created_at)"' > /tmp/runs.txt 2>/tmp/runs.err
         rc=$?
         if [ "${rc}" -ne 0 ]; then
-          echo "::error::拉取运行记录失败 rc=${rc}"
+          echo "::warning::拉取运行记录失败 rc=${rc}"
           cat /tmp/runs.err
-          echo "RUNS=0" >> "${GITHUB_OUTPUT}"
-          exit 1
+          RUNS=0
+        else
+          # 用 wc -l 而不是 grep -c：文件为空时 grep 返回 1，
+          # 配合 || echo 0 会输出两行，写进 GITHUB_OUTPUT 就是非法格式，直接让步骤失败
+          RUNS=$(wc -l < /tmp/runs.txt 2>/dev/null | tr -d ' ' || true)
+          RUNS="${RUNS:-0}"
+          echo "符合条件的运行记录: ${RUNS} 条"
+          head -5 /tmp/runs.txt
         fi
-
-        RUNS=$(grep -c . /tmp/runs.txt 2>/dev/null || echo 0)
-        echo "符合条件的运行记录: ${RUNS} 条"
-        head -5 /tmp/runs.txt
         echo "RUNS=${RUNS}" >> "${GITHUB_OUTPUT}"
 
         # 缓存
@@ -89,19 +91,21 @@ jobs:
         if [ "${rc2}" -ne 0 ]; then
           echo "拉取缓存列表失败 rc=${rc2}"
           cat /tmp/caches.err
-          echo "CACHES=0" >> "${GITHUB_OUTPUT}"
+          : > /tmp/caches.txt
+          CACHES=0
         else
-          CACHES=$(grep -c . /tmp/caches.txt 2>/dev/null || echo 0)
+          CACHES=$(wc -l < /tmp/caches.txt 2>/dev/null | tr -d ' ' || true)
+          CACHES="${CACHES:-0}"
           echo "当前缓存: ${CACHES} 个"
           head -5 /tmp/caches.txt
-          echo "CACHES=${CACHES}" >> "${GITHUB_OUTPUT}"
         fi
+        echo "CACHES=${CACHES}" >> "${GITHUB_OUTPUT}"
 
         {
           echo "## 清理统计"
           echo
           echo "- 待删运行记录：**${RUNS}** 条（早于 ${CUTOFF}）"
-          echo "- 待删缓存：**${CACHES:-0}** 个"
+          echo "- 待删缓存：**${CACHES}** 个"
         } >> "${SUMMARY}"
         exit 0
 
