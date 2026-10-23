@@ -310,12 +310,14 @@ async function main() {
   }
   console.log(`共 ${accounts.length} 个账号`);
 
-  // schedule 触发时随机延迟 0~4 小时，打散时间特征；手动触发跳过
+  // schedule 触发时随机延迟，打散时间特征；手动触发跳过
+  // 上限由 MAX_DELAY_MIN 控制（默认 15 分钟），GitHub 的 schedule 本身会晚 5~30 分钟
   const eventName = process.env.GITHUB_EVENT_NAME || '';
   if (eventName === 'schedule' && process.env.SKIP_DELAY !== '1') {
-    const delay = Math.floor(Math.random() * 4 * 60 * 60 * 1000);
+    const maxMin = Math.max(0, parseInt(process.env.MAX_DELAY_MIN || '15', 10) || 0);
+    const delay = Math.floor(Math.random() * maxMin * 60 * 1000);
     console.log(`🎲 随机延迟 ${Math.round(delay / 60000)} 分钟后开始签到`);
-    const HEARTBEAT = 10 * 60 * 1000;
+    const HEARTBEAT = 5 * 60 * 1000;
     let remaining = delay;
     while (remaining > 0) {
       const step = Math.min(remaining, HEARTBEAT);
