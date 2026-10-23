@@ -35,31 +35,6 @@ jobs:
       with:
         node-version: '24'
 
-    # GitHub Runner 的 Azure 出口 IP 常被目标站丢包。
-    # 挂 WARP 把出口换成 Cloudflare 的 IP；失败就按原出口直连，不阻塞。
-    - name: 挂 Cloudflare WARP 换出口 IP
-      continue-on-error: true
-      run: |
-        set +e
-        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
-          | sudo gpg --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-        for c in noble jammy; do
-          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${c} main" \
-            | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
-          if sudo apt-get update -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/cloudflare-client.list \
-               -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0" >/dev/null 2>&1 \
-             && apt-cache policy cloudflare-warp 2>/dev/null | grep -q Candidate:[[:space:]][0-9]; then
-            break
-          fi
-        done
-        sudo apt-get install -y cloudflare-warp >/dev/null 2>&1 || { echo "WARP 装不上，按原出口直连"; exit 0; }
-        warp-cli --accept-tos registration new >/dev/null 2>&1
-        warp-cli --accept-tos mode warp >/dev/null 2>&1
-        warp-cli --accept-tos connect >/dev/null 2>&1
-        sleep 4
-        curl -s --max-time 10 https://cloudflare.com/cdn-cgi/trace | grep -E "^(warp|colo)=" || true
-        exit 0
-
     - name: 签到
       id: sign
       continue-on-error: true
