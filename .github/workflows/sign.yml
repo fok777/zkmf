@@ -28,11 +28,15 @@ env:
   CLEAN_RETAIN_DAYS: '7'
   CLEAN_CACHE_PREFIX: ''
   CLEAN_ONLY_SELF: 'true'
+  # 定时触发的随机延迟上限（分钟）。GitHub 的 schedule 本身会晚 5~30 分钟，
+  # 再加一点点抖动就够打散特征了，别设太大，否则会撞上 job 超时
+  MAX_DELAY_MIN: '15'
 
 jobs:
   sign:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 延迟最多 15 分钟 + 单请求超时 120s × 重试 4 次 × 整体 4 轮，留足余量
+    timeout-minutes: 90
 
     steps:
     - uses: actions/checkout@v4
@@ -73,6 +77,7 @@ jobs:
         ACCOUNTS: ${{ secrets.ACCOUNTS }}
         GITHUB_EVENT_NAME: ${{ github.event_name }}
         SKIP_DELAY: ${{ github.event.inputs.skip_delay == 'true' && '1' || '' }}
+        MAX_DELAY_MIN: ${{ env.MAX_DELAY_MIN }}
       run: node sign.js 2>&1 | tee /tmp/sign.log
 
     - name: 签到结果
