@@ -25,8 +25,8 @@ env:
 jobs:
   sign:
     runs-on: ubuntu-26.04
-    # 延迟最多 15 分钟 + 单请求超时 120s × 重试 4 次 × 整体 4 轮，留足余量
-    timeout-minutes: 90
+    # WARP 安装最多 8 分钟 + 延迟 15 分钟 + 重试（30s × 3 次 × 3 轮）
+    timeout-minutes: 45
 
     steps:
     - uses: actions/checkout@v5
@@ -34,6 +34,36 @@ jobs:
     - uses: actions/setup-node@v5
       with:
         node-version: '24'
+
+    # GitHub Runner 所在的 Azure 段到 bbs.binmt.cc 会 SYN 丢包（约 5s 超时），
+    # 直连必失败。挂 WARP 把出口换成 Cloudflare 的 IP。
+    # 只用 jammy 源（Cloudflare 官方最全），避免逐个试源拖时间。
+    - name: 挂 Cloudflare WARP 换出口 IP
+      continue-on-error: true
+      timeout-minutes: 8
+      run: |
+        set +e
+        curl -fsSL --max-time 20 https://pkg.cloudflareclient.com/pubkey.gpg \
+          | sudo gpg --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+        echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ jammy main" \
+          | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+        sudo apt-get update -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/cloudflare-client.list \
+          -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0" 2>&1 | tail -3
+        sudo apt-get install -y cloudflare-warp 2>&1 | tail -3 || { echo "WARP 装不上，按原出口直连"; exit 0; }
+
+        warp-cli --accept-tos registration new 2>&1 | tail -2
+        warp-cli --accept-tos mode warp 2>&1 | tail -2
+        warp-cli --accept-tos connect 2>&1 | tail -2
+        sleep 4
+        warp-cli --accept-tos status 2>&1 | tail -3
+
+        echo "--- 当前出口 ---"
+        curl -s --max-time 15 https://cloudflare.com/cdn-cgi/trace | grep -E "^(ip|warp|colo)=" || true
+        echo "--- 目标站连通性 ---"
+        curl -s -o /dev/null -w "bbs.binmt.cc -> HTTP %{http_code} 连接 %{time_connect}s\n" \
+          --max-time 25 -4 -A 'Mozilla/5.0 (Linux; Android 11; SM-G975F) Chrome/116.0.0.0 Mobile Safari/537.36' \
+          https://bbs.binmt.cc/k_misign-sign.html || echo "目标站仍不可达"
+        exit 0
 
     - name: 签到
       id: sign
