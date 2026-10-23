@@ -43,7 +43,9 @@ jobs:
         GITHUB_EVENT_NAME: ${{ github.event_name }}
         SKIP_DELAY: ${{ github.event.inputs.skip_delay == 'true' && '1' || '' }}
         MAX_DELAY_MIN: ${{ env.MAX_DELAY_MIN }}
-      run: node sign.js 2>&1 | tee /tmp/sign.log
+      run: |
+        node -v
+        node sign.js 2>&1 | tee /tmp/sign.log
 
     - name: 签到结果
       if: ${{ always() }}
