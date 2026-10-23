@@ -32,10 +32,11 @@ const BASE = 'https://bbs.binmt.cc';
 // 触发 WAF 挑战的概率明显低于桌面 UA，这也是他那套几秒就完成的原因之一
 const UA = 'Mozilla/5.0 (Linux; Android 11; SM-G975F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36';
 
-const REQ_TIMEOUT = 120000;
-const REQ_RETRIES = 4;
-const FLOW_ATTEMPTS = 4;
-const FLOW_DELAYS = [30000, 60000, 120000];
+// 丢包时 SYN 约 5s 就失败，120s 毫无意义；WARP 通了之后 30s 也够用
+const REQ_TIMEOUT = 30000;
+const REQ_RETRIES = 3;
+const FLOW_ATTEMPTS = 3;
+const FLOW_DELAYS = [15000, 30000];
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
