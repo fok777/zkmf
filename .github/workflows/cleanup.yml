@@ -1,0 +1,170 @@
+name: 每周清理
+
+on:
+  schedule:
+    # cron 按 UTC 执行
+    # UTC 周六 19:00 = 北京时间周日 03:00
+    - cron: '0 19 * * 6'
+  workflow_dispatch:
+    inputs:
+      retain_days:
+        description: '保留最近多少天的运行记录（更早的删除）'
+        type: string
+        default: '7'
+      delete_caches:
+        description: '是否删除 Actions 缓存'
+        type: boolean
+        default: true
+      dry_run:
+        description: '仅统计不删除（演练）'
+        type: boolean
+        default: false
+
+# 删除运行记录和缓存都需要 actions: write
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+
+    env:
+      RETAIN_DAYS: '7'
+
+    steps:
+    - name: 权限自检
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        set +e
+        echo "仓库: ${GITHUB_REPOSITORY}"
+        echo "token 实际权限:"
+        gh api "repos/${GITHUB_REPOSITORY}" --jq '.permissions' 2>&1
+        echo
+        echo "若上面 push/admin 为 false，说明 token 权限不足，删除会失败。"
+        echo "还需确认 Settings → Actions → General → Workflow permissions 选的是 Read and write。"
+        exit 0
+
+    - name: 统计待清理项
+      id: stat
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        INPUT_RETAIN: ${{ github.event.inputs.retain_days }}
+      run: |
+        set +e
+        SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/null}"
+        R="${INPUT_RETAIN:-${RETAIN_DAYS}}"
+        R="${R:-7}"
+        echo "保留最近 ${R} 天"
+
+        CUTOFF=$(date -u -d "${R} days ago" +%Y-%m-%d)
+        echo "截止日期: ${CUTOFF}（早于此且已完成的运行将被删除）"
+        echo "CUTOFF=${CUTOFF}" >> "${GITHUB_OUTPUT}"
+
+        # 只拉「已完成」且「早于截止日」的记录，量小很多
+        # URL 里的 < 必须编码成 %3C
+        gh api --paginate \
+          "repos/${GITHUB_REPOSITORY}/actions/runs?per_page=100&status=completed&created=%3C${CUTOFF}" \
+          --jq '.workflow_runs[] | "\(.id) \(.created_at)"' > /tmp/runs.txt 2>/tmp/runs.err
+        rc=$?
+        if [ "${rc}" -ne 0 ]; then
+          echo "::error::拉取运行记录失败 rc=${rc}"
+          cat /tmp/runs.err
+          echo "RUNS=0" >> "${GITHUB_OUTPUT}"
+          exit 1
+        fi
+
+        RUNS=$(grep -c . /tmp/runs.txt 2>/dev/null || echo 0)
+        echo "符合条件的运行记录: ${RUNS} 条"
+        head -5 /tmp/runs.txt
+        echo "RUNS=${RUNS}" >> "${GITHUB_OUTPUT}"
+
+        # 缓存
+        gh api --paginate \
+          "repos/${GITHUB_REPOSITORY}/actions/caches?per_page=100" \
+          --jq '.actions_caches[] | "\(.id) \(.key)"' > /tmp/caches.txt 2>/tmp/caches.err
+        rc2=$?
+        if [ "${rc2}" -ne 0 ]; then
+          echo "拉取缓存列表失败 rc=${rc2}"
+          cat /tmp/caches.err
+          echo "CACHES=0" >> "${GITHUB_OUTPUT}"
+        else
+          CACHES=$(grep -c . /tmp/caches.txt 2>/dev/null || echo 0)
+          echo "当前缓存: ${CACHES} 个"
+          head -5 /tmp/caches.txt
+          echo "CACHES=${CACHES}" >> "${GITHUB_OUTPUT}"
+        fi
+
+        {
+          echo "## 清理统计"
+          echo
+          echo "- 待删运行记录：**${RUNS}** 条（早于 ${CUTOFF}）"
+          echo "- 待删缓存：**${CACHES:-0}** 个"
+        } >> "${SUMMARY}"
+        exit 0
+
+    - name: 删除运行记录
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        INPUT_DRY: ${{ github.event.inputs.dry_run }}
+      run: |
+        set +e
+        SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/null}"
+        [ -s /tmp/runs.txt ] || { echo "没有需要删除的运行记录"; exit 0; }
+
+        if [ "${INPUT_DRY}" = "true" ]; then
+          echo "演练模式：跳过删除"
+          echo "（演练模式，未删除）" >> "${SUMMARY}"
+          exit 0
+        fi
+
+        OK=0; FAIL=0
+        while read -r id created; do
+          [ -n "${id:-}" ] || continue
+          if out=$(gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/runs/${id}" 2>&1); then
+            OK=$(( OK + 1 ))
+          else
+            FAIL=$(( FAIL + 1 ))
+            echo "删除失败 ${id}（${created}）: $(echo "${out}" | head -2 | tr '\n' ' ')"
+          fi
+        done < /tmp/runs.txt
+
+        echo "运行记录：删除成功 ${OK} 条，失败 ${FAIL} 条"
+        echo "- 运行记录删除：成功 ${OK}，失败 ${FAIL}" >> "${SUMMARY}"
+        if [ "${FAIL}" -gt 0 ] && [ "${OK}" -eq 0 ]; then
+          echo "::error::全部删除失败，多半是 token 没有 actions: write 权限"
+        fi
+        exit 0
+
+    - name: 删除缓存
+      if: ${{ github.event_name != 'schedule' || github.event.inputs.delete_caches != 'false' }}
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        INPUT_DRY: ${{ github.event.inputs.dry_run }}
+      run: |
+        set +e
+        SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/null}"
+        [ -s /tmp/caches.txt ] || { echo "没有缓存可删"; exit 0; }
+
+        if [ "${INPUT_DRY}" = "true" ]; then
+          echo "演练模式：跳过删除"
+          echo "（演练模式，未删除缓存）" >> "${SUMMARY}"
+          exit 0
+        fi
+
+        OK=0; FAIL=0
+        while read -r id key; do
+          [ -n "${id:-}" ] || continue
+          if out=$(gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/caches/${id}" 2>&1); then
+            OK=$(( OK + 1 ))
+          else
+            FAIL=$(( FAIL + 1 ))
+            echo "删除失败 ${id}（${key}）: $(echo "${out}" | head -2 | tr '\n' ' ')"
+          fi
+        done < /tmp/caches.txt
+
+        echo "缓存：删除成功 ${OK} 个，失败 ${FAIL} 个"
+        echo "- 缓存删除：成功 ${OK}，失败 ${FAIL}" >> "${SUMMARY}"
+        exit 0
