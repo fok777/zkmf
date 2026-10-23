@@ -1,70 +1,67 @@
 #!/usr/bin/env node
 /**
  * MT论坛 (bbs.binmt.cc) 自动签到脚本 (Node.js)
- *
- * 基于 Xingyan777/binmt-auto-signin 改造：
- *   - 登录方式由 Cookie 改为「账号 + 密码」，自动走登录流程拿 Cookie
- *   - 保留原版的 WAF 沙箱、强制 IPv4、重试策略
+ * 部署到 GitHub Actions 每天自动运行
  *
  * 功能：
- *  1. 账号密码登录（自动提取 loginhash / formhash）
- *  2. 自动过阿里云 WAF (acw_sc__v2 JS 挑战)
+ *  1. 自动过阿里云 WAF (acw_sc__v2 JS 挑战)
+ *  2. 动态获取 formhash
  *  3. 调用 k_misign 插件签到接口
  *
  * 容错：
- *  - 强制 IPv4（论坛 IPv6 链路不通，会挂起到超时）
- *  - 单次请求超时 120s，自动重试 4 次
- *  - 整个流程整体重试最多 4 轮（应对海外 runner 到国内站网络波动）
- *  - 密码错误立即终止，不做无意义重试
+ *  - 强制 IPv4（论坛 IPv6 链路不通，避免偶发快速超时）
+ *  - 单次请求超时 120s
+ *  - 单次请求自动重试 4 次
+ *  - 整个签到流程整体重试最多 4 轮（应对海外 runner 到国内站网络波动）
  *
  * 配置（环境变量）：
- *  ACCOUNTS  - 多行 "user:pass"，必填
+ *  ACCOUNTS    - 每行 "用户名:密码"，必填（本版本新增，脚本自动登录取 Cookie）
+ *  BBS_COOKIE  - 可选。给了就按 Xingyan777 原版方式直接签到，跳过登录
  */
 
 const https = require('https');
-const http = require('http');
 const vm = require('vm');
 const zlib = require('zlib');
 const { URLSearchParams } = require('url');
 
 const BASE = 'https://bbs.binmt.cc';
-// 沿用 Xingyan777 的移动端 UA：论坛对移动端返回更简单的页面，
-// 触发 WAF 挑战的概率明显低于桌面 UA，这也是他那套几秒就完成的原因之一
 const UA = 'Mozilla/5.0 (Linux; Android 11; SM-G975F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36';
 
-// 丢包时 SYN 约 5s 就失败，120s 毫无意义；WARP 通了之后 30s 也够用
-const REQ_TIMEOUT = 30000;
-const REQ_RETRIES = 3;
-const FLOW_ATTEMPTS = 3;
-const FLOW_DELAYS = [15000, 30000];
+const REQ_TIMEOUT = 120000;
+const REQ_RETRIES = 4;
+const FLOW_ATTEMPTS = 4;
+const FLOW_DELAYS = [30000, 60000, 120000];
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// ---------- 基础请求 ----------
 function request(url, cookieStr, opts = {}) {
   return new Promise((resolve, reject) => {
     const u = new URL(url, BASE);
-    const mod = u.protocol === 'https:' ? https : http;
+    const isHttps = u.protocol === 'https:';
+    const mod = isHttps ? https : require('http');
     const headers = Object.assign({
       'User-Agent': UA,
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Encoding': 'gzip, deflate',
+      'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
+      'Accept-Encoding': 'gzip, deflate, br',
       'Accept-Language': 'zh-CN,zh;q=0.9',
-      'Origin': BASE,
       'Referer': BASE + '/',
       'Connection': 'close',
     }, opts.headers || {});
     if (cookieStr) headers['Cookie'] = cookieStr;
 
+    // 唯一对原版 request() 的扩展：传 opts.form 时走 POST（登录要用）
+    // 不传则与 Xingyan777 原版完全一致
     let payload = null;
     if (opts.form) {
       payload = new URLSearchParams(opts.form).toString();
       headers['Content-Type'] = 'application/x-www-form-urlencoded';
       headers['Content-Length'] = Buffer.byteLength(payload);
+      headers['Origin'] = BASE;
     }
 
     const t0 = Date.now();
-    // family:4 强制走 IPv4 —— 论坛 IPv6 链路不通，runner 有 IPv6 时会挂起到超时
+    // family:4 强制走 IPv4 —— bbs.binmt.cc 的 IPv6 链路不通（会挂起到超时），
+    // GitHub runner 有 IPv6 地址，若不强制 IPv4 会偶发连接被丢弃导致快速 timeout
     const reqObj = mod.request(u, { headers, family: 4, method: payload ? 'POST' : 'GET' }, res => {
       const chunks = [];
       res.on('data', c => chunks.push(c));
@@ -74,18 +71,18 @@ function request(url, cookieStr, opts = {}) {
         try {
           if (enc.includes('gzip')) buf = zlib.gunzipSync(buf);
           else if (enc.includes('deflate')) buf = zlib.inflateSync(buf);
+          else if (enc.includes('br')) buf = zlib.brotliDecompressSync(buf);
         } catch (e) { /* 保留原文 */ }
-        const setCookie = (res.headers['set-cookie'] || []).map(c => c.split(';')[0]).join('; ');
+        const setCookie = (res.headers['set-cookie'] || []).join('; ');
         resolve({
           status: res.statusCode,
-          body: buf.toString('utf8'),
+          body: buf.toString(),
           setCookie,
           headers: res.headers,
           ms: Date.now() - t0,
         });
       });
     });
-
     reqObj.setTimeout(REQ_TIMEOUT, () => reqObj.destroy(new Error('timeout')));
     reqObj.on('error', err => { err.reqMs = Date.now() - t0; reject(err); });
     if (payload) reqObj.write(payload);
@@ -114,28 +111,31 @@ function mergeCookies(...cookStrs) {
       if (!part) continue;
       const eq = part.indexOf('=');
       if (eq === -1) continue;
-      map.set(part.slice(0, eq).trim(), part.slice(eq + 1));
+      const k = part.slice(0, eq).trim();
+      const v = part.slice(eq + 1);
+      map.set(k, v);
     }
   }
-  return [...map].map(([k, v]) => `${k}=${v}`).join('; ');
+  const out = [];
+  for (const [k, v] of map) out.push(k + '=' + v);
+  return out.join('; ');
 }
 
-// ---------- 阿里云 WAF (acw_sc__v2) ----------
 function solveAcwChallenge(html) {
   const m = html.match(/<script>([\s\S]*?)<\/script>/);
   if (!m) return null;
   const js = m[1];
-  // 与 Xingyan777 一致：先确认是含 arg1 的 acw 挑战脚本
-  if (!/arg1\s*=\s*'([0-9A-Fa-f]+)'/.test(js)) return null;
+  const arg1m = js.match(/arg1\s*=\s*'([0-9A-Fa-f]+)'/);
+  if (!arg1m) return null;
+  const arg1 = arg1m[1];
   let cookieVal = '';
   const sandbox = {
     document: {},
-    location: { reload() {}, href: BASE + '/' },
+    location: { reload() {} },
     navigator: { userAgent: UA, platform: 'Linux x86_64' },
     localStorage: { getItem: () => null, setItem: () => {} },
-    Date, Math, RegExp, String, Array, Object, Number, Boolean,
-    parseInt, parseFloat, isNaN, decodeURIComponent, encodeURIComponent,
-    escape, unescape, setTimeout, console,
+    Date, Math, RegExp, String, Array, parseInt, parseFloat,
+    decodeURIComponent, encodeURIComponent, console,
   };
   Object.defineProperty(sandbox.document, 'cookie', {
     get() { return cookieVal; },
@@ -144,13 +144,8 @@ function solveAcwChallenge(html) {
   try {
     vm.createContext(sandbox);
     vm.runInContext(js, sandbox, { timeout: 5000 });
-  } catch (e) { /* 忽略，挑战脚本常带反调试 */ }
+  } catch (e) { /* 忽略 */ }
   if (cookieVal.includes('acw_sc__v2')) return cookieVal;
-  // 少数版本直接把结果写在变量里
-  try {
-    const v = sandbox.acw_sc__v2 || sandbox.arg2;
-    if (v) return `acw_sc__v2=${v}`;
-  } catch (e) {}
   return null;
 }
 
@@ -158,7 +153,7 @@ async function getWithWaf(url, cookie) {
   let c = cookie;
   for (let i = 0; i < 3; i++) {
     const r = await requestWithRetry(url, c);
-    if (/acw_sc__v2/.test(r.body) && /<script>[\s\S]*arg1\s*=/.test(r.body)) {
+    if (r.body.includes('acw_sc__v2') && /<script>[\s\S]*arg1\s*=/.test(r.body)) {
       const acw = solveAcwChallenge(r.body);
       if (acw) {
         c = mergeCookies(c, acw, r.setCookie);
@@ -170,12 +165,63 @@ async function getWithWaf(url, cookie) {
   return null;
 }
 
-async function postWithWaf(url, cookie, form) {
-  const r = await requestWithRetry(url, cookie, { form });
-  return { res: r, cookie: mergeCookies(cookie, r.setCookie) };
+function parseResult(respBody) {
+  const clean = respBody
+    .replace(/^<\?xml[\s\S]*?<root><!\[CDATA\[/, '')
+    .replace(/\]\]><\/root>[\s\S]*$/, '')
+    .replace(/^<\/?root>/, '')
+    .trim();
+  const text = clean || respBody.replace(/<[^>]+>/g, '').trim();
+  if (/已签到|今日已签|今日已签到/.test(respBody)) return { kind: 'already', text };
+  if (/签到成功|成功.*获取|签到.*成功/.test(respBody)) return { kind: 'success', text };
+  if (respBody.includes('登录') && !respBody.includes('今日')) return { kind: 'expired', text };
+  return { kind: 'unknown', text };
 }
 
-// ---------- 页面解析 ----------
+async function attemptSign(cookie) {
+  const signUrl = BASE + '/k_misign-sign.html';
+  const sf = await getWithWaf(signUrl, cookie);
+  if (!sf) return { ok: false, msg: '多次请求仍被 WAF 拦截' };
+  const html = sf.res.body;
+  const cookieWithWaf = sf.cookie;
+  console.log(`签到页: HTTP ${sf.res.status} ${sf.res.ms}ms, ${html.length}B`);
+
+  const fh = html.match(/formhash=([a-f0-9]{8})/);
+  if (!fh) return { ok: false, msg: '未能获取 formhash（cookie 可能已失效）' };
+  const formhash = fh[1];
+  console.log('✅ formhash =', formhash);
+
+  const qdUrl = `${BASE}/plugin.php?id=k_misign:sign&operation=qiandao&format=text&formhash=${formhash}`;
+  const qd = await getWithWaf(qdUrl, cookieWithWaf);
+  if (!qd) return { ok: false, msg: '签到请求被 WAF 拦截' };
+  console.log(`签到接口: HTTP ${qd.res.status} ${qd.res.ms}ms`);
+
+  const respBody = qd.res.body;
+  const result = parseResult(respBody);
+
+  if (result.kind === 'already') {
+    console.log('📅 今日已签到过: ' + result.text);
+    return { ok: true, text: result.text };
+  }
+  if (result.kind === 'success') {
+    console.log('✅ ' + result.text);
+    return { ok: true, text: result.text };
+  }
+  if (result.kind === 'expired') {
+    console.log('❌ Cookie 已失效，请更新 BBS_COOKIE');
+    return { ok: false, fatal: true, msg: 'Cookie 已失效', text: result.text };
+  }
+  console.log('ℹ️ 签到返回: ' + result.text);
+  return { ok: true, text: result.text };
+}
+
+// ============================================================
+// 以下为本站唯一改动：登录方式
+// Xingyan777 原版直接用环境变量 BBS_COOKIE 里的 Cookie 签到；
+// 这里改为「账号 + 密码」，先走 Discuz 登录流程拿到 Cookie，
+// 再把 Cookie 交给原版 attemptSign(cookie)，其余流程一字不动。
+// ============================================================
+
 function pickFormhash(html) {
   const pats = [
     /name=["']formhash["']\s+value=["']([A-Za-z0-9]{4,16})["']/,
@@ -213,29 +259,26 @@ function stripCdata(body) {
   return s.slice(0, 200);
 }
 
-function parseSignResult(raw) {
-  const text = stripCdata(raw);
-  if (/已签|今日已签|签到已完成|已经签到/.test(raw)) return { kind: 'already', text };
-  if (/签到成功|成功.*获取|恭喜|success|qiandao_success|获得/.test(raw)) return { kind: 'success', text };
-  if (/未登录|请登录|请先登录|非法|重新登录/.test(raw)) return { kind: 'needLogin', text };
-  return { kind: 'unknown', text };
-}
-
 function maskUser(u) {
-  if (/^1[3-9]\d{9}$/.test(u) && u.length === 11) return `${u.slice(0, 3)}****${u.slice(-4)}`;
+  if (/^1[3-9]\d{9}$/.test(u)) return `${u.slice(0, 3)}****${u.slice(-4)}`;
   return u.slice(0, 2) + '***' + u.slice(-1);
 }
 
-// ---------- 登录 + 签到 ----------
-async function attemptSign(user, pwd) {
-  // 1) 登录页
-  const loginPageUrl = '/member.php?mod=logging&action=login&infloat=yes&handlekey=login&inajax=1&ajaxtarget=fwin_content_login';
-  const lp = await getWithWaf(loginPageUrl, '');
+/**
+ * 账号密码登录，返回可用于签到的 Cookie 串
+ * 成功 -> { ok: true, cookie }
+ * 失败 -> { ok: false, fatal?: true, msg }
+ */
+async function login(user, pwd) {
+  // 1) 打开登录页（同样过 WAF），取 loginhash / formhash
+  const loginPage = '/member.php?mod=logging&action=login&infloat=yes&handlekey=login&inajax=1&ajaxtarget=fwin_content_login';
+  const lp = await getWithWaf(loginPage, '');
   if (!lp) return { ok: false, msg: '登录页被 WAF 拦截' };
-  const loginhash = pickLoginhash(lp.res.body);
+
   const formhash = pickFormhash(lp.res.body);
-  if (!formhash) return { ok: false, msg: '未能从登录页取到 formhash' };
-  console.log(`登录页 HTTP ${lp.res.status} ${lp.res.ms}ms | formhash=${formhash} loginhash=${loginhash || '-'}`);
+  if (!formhash) return { ok: false, msg: '登录页未取到 formhash' };
+  const loginhash = pickLoginhash(lp.res.body);
+  console.log(`登录页: HTTP ${lp.res.status} ${lp.res.ms}ms | formhash=${formhash} loginhash=${loginhash || '-'}`);
 
   // 2) 提交登录
   const loginUrl = `/member.php?mod=logging&action=login&loginsubmit=yes&handlekey=login&loginhash=${loginhash}&inajax=1`;
@@ -249,51 +292,30 @@ async function attemptSign(user, pwd) {
     answer: '',
     agreebbrule: '',
   };
-  const lg = await postWithWaf(loginUrl, lp.cookie, form);
-  const lgText = stripCdata(lg.res.body);
-  if (/登录失败|密码错误|用户名.*?不正确|密码.*?不正确|账号不存在|安全提问|您的账号/.test(lg.res.body)) {
-    return { ok: false, fatal: true, msg: `账号或密码有误：${lgText}` };
+
+  let r;
+  try {
+    r = await requestWithRetry(loginUrl, lp.cookie, { form });
+  } catch (e) {
+    return { ok: false, msg: `登录请求失败: ${e.message}` };
   }
-  if (!/登录成功|欢迎您回来|succeed|location\.reload/.test(lg.res.body)) {
-    console.log(`ℹ️ 登录响应未知: ${lgText}`);
+  console.log(`登录接口: HTTP ${r.status} ${r.ms}ms`);
+
+  const text = stripCdata(r.body);
+  if (/登录失败|密码错误|用户名.*?不正确|密码.*?不正确|账号不存在|安全提问|您的账号|尝试次数过多/.test(r.body)) {
+    return { ok: false, fatal: true, msg: `账号或密码有误：${text}` };
   }
-  let cookie = lg.cookie;
-  // Discuz 登录成功后 set-cookie 会带 saltkey / auth
-  const logged = /saltkey|auth/i.test(cookie) || /登录成功|欢迎您回来/.test(lg.res.body);
+
+  const cookie = mergeCookies(lp.cookie, r.setCookie);
+  // Discuz 登录成功会在 set-cookie 里下发 saltkey / auth
+  const logged = /saltkey|auth/i.test(cookie) || /登录成功|欢迎您回来/.test(r.body);
   if (!logged) {
-    return { ok: false, msg: '登录未确认（未拿到会话 Cookie）' };
+    return { ok: false, msg: `登录未确认（未拿到会话 Cookie）：${text}` };
   }
   console.log('✅ 登录成功，已取得会话 Cookie');
-
-  await sleep(1200);
-
-  // 3) 签到页取 formhash
-  const sp = await getWithWaf('/k_misign-sign.html', cookie);
-  if (!sp) return { ok: false, msg: '签到页被 WAF 拦截' };
-  cookie = sp.cookie;
-  const sfh = pickFormhash(sp.res.body);
-  if (!sfh) return { ok: false, msg: '未能从签到页取到 formhash（Cookie 可能无效）' };
-  console.log(`签到页 HTTP ${sp.res.status} ${sp.res.ms}ms | formhash=${sfh}`);
-
-  await sleep(1200);
-
-  // 4) 调签到接口
-  const qdUrl = `/plugin.php?id=k_misign:sign&operation=qiandao&format=text&formhash=${sfh}`;
-  const qd = await getWithWaf(qdUrl, cookie);
-  if (!qd) return { ok: false, msg: '签到接口被 WAF 拦截' };
-  const result = parseSignResult(qd.res.body);
-  console.log(`签到接口 HTTP ${qd.res.status} ${qd.res.ms}ms -> ${result.text}`);
-
-  if (result.kind === 'already' || result.kind === 'success') {
-    return { ok: true, text: result.text };
-  }
-  if (result.kind === 'needLogin') {
-    return { ok: false, msg: '会话失效，签到时仍判定未登录' };
-  }
-  return { ok: false, msg: `签到未确认：${result.text}` };
+  return { ok: true, cookie };
 }
 
-// ---------- 主流程 ----------
 function parseAccounts() {
   const raw = (process.env.ACCOUNTS || '').replace(/\r/g, '');
   const out = [];
@@ -308,20 +330,28 @@ function parseAccounts() {
 }
 
 async function main() {
-  const accounts = parseAccounts();
-  if (!accounts.length) {
-    console.log('❌ 缺少环境变量 ACCOUNTS，格式：每行 user:pass');
-    process.exit(1);
-  }
-  console.log(`共 ${accounts.length} 个账号`);
+  // 兼容 Xingyan777 原版：直接给了 BBS_COOKIE 就跳过登录
+  let directCookie = (process.env.BBS_COOKIE || '').replace(/[;%\s]+$/, '').trim();
 
-  // schedule 触发时随机延迟，打散时间特征；手动触发跳过
-  // 上限由 MAX_DELAY_MIN 控制（默认 15 分钟），GitHub 的 schedule 本身会晚 5~30 分钟
+  let accounts = [];
+  if (!directCookie) {
+    accounts = parseAccounts();
+    if (!accounts.length) {
+      console.log('❌ 缺少环境变量 ACCOUNTS（每行 用户名:密码），或直接给 BBS_COOKIE');
+      process.exit(1);
+    }
+    console.log(`共 ${accounts.length} 个账号`);
+  } else {
+    console.log('使用 BBS_COOKIE，跳过登录');
+  }
+
+  // 随机延迟：仅 schedule 触发时生效，workflow_dispatch（手动）跳过
+  // 上限由 MAX_DELAY_MIN 控制，默认 15 分钟
   const eventName = process.env.GITHUB_EVENT_NAME || '';
   if (eventName === 'schedule' && process.env.SKIP_DELAY !== '1') {
     const maxMin = Math.max(0, parseInt(process.env.MAX_DELAY_MIN || '15', 10) || 0);
     const delay = Math.floor(Math.random() * maxMin * 60 * 1000);
-    console.log(`🎲 随机延迟 ${Math.round(delay / 60000)} 分钟后开始签到`);
+    console.log(`🎲 随机延迟 ${Math.round(delay / 60000)} 分钟后开始签到...`);
     const HEARTBEAT = 5 * 60 * 1000;
     let remaining = delay;
     while (remaining > 0) {
@@ -330,38 +360,82 @@ async function main() {
       remaining -= step;
       if (remaining > 0) console.log(`⏳ 剩余 ${Math.round(remaining / 60000)} 分钟...`);
     }
-    console.log('⏰ 延迟结束，开始签到');
+    console.log('⏰ 延迟结束，开始签到！');
   } else {
     console.log('🚀 手动触发，跳过随机延迟');
   }
 
+  const targets = directCookie
+    ? [['(BBS_COOKIE)', directCookie]]
+    : accounts.map(([u, p]) => [u, p]);
+
   const failed = [];
-  for (const [user, pwd] of accounts) {
-    console.log(`\n========== 账号 ${maskUser(user)} ==========`);
+
+  for (const [label, secret] of targets) {
+    console.log(`\n========== 账号 ${maskUser(label)} ==========`);
+
+    let cookie = null;
+    if (directCookie) {
+      cookie = directCookie;
+    } else {
+      // 登录这一步只做 1 次：密码错是 fatel，重试没意义；网络错交给下面的整体重试
+      let lg = null;
+      for (let li = 1; li <= 3 && !lg; li++) {
+        if (li > 1) {
+          console.log(`🔁 登录重试第 ${li} 次`);
+          await sleep(5000);
+        }
+        try {
+          const r = await login(label, secret);
+          if (r.ok) { lg = r; break; }
+          if (r.fatal) {
+            console.log(`❌ ${maskUser(label)} ${r.msg}`);
+            break;
+          }
+          console.log(`⚠️ ${maskUser(label)} ${r.msg}`);
+        } catch (e) {
+          console.log(`⚠️ ${maskUser(label)} 登录异常: ${e.message} code=${e.code || '-'}`);
+        }
+      }
+      if (!lg) {
+        failed.push(maskUser(label));
+        continue;
+      }
+      cookie = lg.cookie;
+    }
+
+    // —— 以下与 Xingyan777 原版完全一致 ——
     let ok = false;
     for (let attempt = 1; attempt <= FLOW_ATTEMPTS; attempt++) {
       if (attempt > 1) {
-        const d = FLOW_DELAYS[attempt - 2] || 120000;
-        console.log(`🔄 第 ${attempt} 轮（等待 ${d / 1000}s）...`);
-        await sleep(d);
+        const delay = FLOW_DELAYS[attempt - 2] || 120000;
+        console.log(`\n🔄 整体第 ${attempt} 轮尝试（等待 ${delay / 1000}s 后开始）...`);
+        await sleep(delay);
       }
       try {
-        const r = await attemptSign(user, pwd);
+        const r = await attemptSign(cookie);
         if (r.ok) {
-          console.log(`✅ ${maskUser(user)} 签到完成: ${r.text}`);
+          console.log('✅ 签到流程成功.');
+          console.log('RESULT_BODY=' + JSON.stringify(r.text));
           ok = true;
           break;
         }
         if (r.fatal) {
-          console.log(`❌ ${maskUser(user)} ${r.msg}`);
+          console.log(`❌ ${r.msg}`);
           break;
         }
-        console.log(`⚠️ ${maskUser(user)} 本轮未完成: ${r.msg}`);
+        console.log(`⚠️ 本轮未完成: ${r.msg}`);
       } catch (e) {
-        console.log(`⚠️ ${maskUser(user)} 本轮异常: ${e.message} code=${e.code || '-'}`);
+        console.log(`⚠️ 本轮异常: ${e.message} code=${e.code || '-'}`);
       }
     }
-    if (!ok) failed.push(maskUser(user));
+
+    if (ok) {
+      console.log(`✅ ${maskUser(label)} 签到完成`);
+    } else {
+      console.log(`❌ ${maskUser(label)} 多次尝试均失败，签到未完成`);
+      failed.push(maskUser(label));
+    }
   }
 
   if (failed.length) {
