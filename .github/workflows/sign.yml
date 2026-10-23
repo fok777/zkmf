@@ -9,10 +9,6 @@ on:
     - cron: '13 0 * * *'
   workflow_dispatch:
     inputs:
-      cleanup:
-        description: '跑完后清理旧的运行记录与缓存'
-        type: boolean
-        default: true
       skip_delay:
         description: '跳过随机延迟（立即签到）'
         type: boolean
@@ -20,21 +16,15 @@ on:
 
 permissions:
   contents: read
-  actions: write
 
 env:
-  # —— 清理策略 ——
-  CLEAN_KEEP_RUNS: '5'
-  CLEAN_RETAIN_DAYS: '7'
-  CLEAN_CACHE_PREFIX: ''
-  CLEAN_ONLY_SELF: 'true'
   # 定时触发的随机延迟上限（分钟）。GitHub 的 schedule 本身会晚 5~30 分钟，
   # 再加一点点抖动就够打散特征了，别设太大，否则会撞上 job 超时
   MAX_DELAY_MIN: '15'
 
 jobs:
   sign:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # 延迟最多 15 分钟 + 单请求超时 120s × 重试 4 次 × 整体 4 轮，留足余量
     timeout-minutes: 90
 
@@ -43,7 +33,7 @@ jobs:
 
     - uses: actions/setup-node@v4
       with:
-        node-version: '20'
+        node-version: '24'
 
     # GitHub Runner 的 Azure 出口 IP 常被目标站丢包。
     # 挂 WARP 把出口换成 Cloudflare 的 IP；失败就按原出口直连，不阻塞。
@@ -120,54 +110,3 @@ jobs:
           echo
           echo "</details>"
         } >> "${SUMMARY}"
-
-    # —— 打扫卫生，签到成败都会执行 ——
-    - name: 清理旧的 workflow 运行记录
-      if: ${{ always() && github.event.inputs.cleanup != 'false' }}
-      continue-on-error: true
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        set +e
-        SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/null}"
-        CUTOFF=$(date -u -d "${CLEAN_RETAIN_DAYS} days ago" +%s) || exit 0
-
-        gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs?per_page=100" \
-          --jq '.workflow_runs[]
-                | select(env.CLEAN_ONLY_SELF != "true" or .name == env.GITHUB_WORKFLOW)
-                | "\(.id) \(.created_at)"' > /tmp/runs.txt 2>/dev/null || {
-          echo "拉取运行记录失败，跳过清理"
-          exit 0
-        }
-
-        KEEP=$(( CLEAN_KEEP_RUNS + 1 ))
-        tail -n +"${KEEP}" /tmp/runs.txt | while read -r id created; do
-          [ -n "${id:-}" ] && [ -n "${created:-}" ] || continue
-          ts=$(date -u -d "${created}" +%s 2>/dev/null) || continue
-          [ -n "${ts}" ] || continue
-          if [ "${ts}" -lt "${CUTOFF}" ]; then
-            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/runs/${id}" >/dev/null 2>&1 \
-              && echo "- 删除运行记录 ${id}" >> "${SUMMARY}"
-          fi
-        done
-        echo "旧运行记录清理完成" >> "${SUMMARY}"
-        exit 0
-
-    - name: 清理 Actions 缓存
-      if: ${{ always() && github.event.inputs.cleanup != 'false' }}
-      continue-on-error: true
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        set +e
-        SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/null}"
-        IDS=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/caches?per_page=100" \
-          --jq '[.actions_caches[] | select(.key | startswith(env.CLEAN_CACHE_PREFIX)) | .id] | .[]' 2>/dev/null) || IDS=""
-        N=0
-        for id in ${IDS}; do
-          if gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/caches/${id}" >/dev/null 2>&1; then
-            N=$(( N + 1 ))
-          fi
-        done
-        echo "已清理缓存 ${N} 个" >> "${SUMMARY}"
-        exit 0
