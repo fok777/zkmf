@@ -222,31 +222,72 @@ async function attemptSign(cookie) {
 // 再把 Cookie 交给原版 attemptSign(cookie)，其余流程一字不动。
 // ============================================================
 
-function pickFormhash(html) {
-  const pats = [
-    /name=["']formhash["']\s+value=["']([A-Za-z0-9]{4,16})["']/,
-    /value=["']([A-Za-z0-9]{4,16})["']\s+name=["']formhash["']/,
-    /formhash=([A-Za-z0-9]{8})/,
-    /formhash["']?\s*[:=]\s*["']?([A-Za-z0-9]{4,16})/,
+// Discuz 用 inajax=1 时把 HTML 塞进 <![CDATA[...]]>，
+// 里面的引号会被转成 &quot; / &#39;，必须先反转义才匹配得上
+function decodeEntities(s) {
+  return s
+    .replace(/&quot;/g, '"')
+    .replace(/&#0*34;/g, '"')
+    .replace(/&#x0*22;/gi, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#0*39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+}
+
+// 把 CDATA 里的 HTML 掏出来（不去头尾，只剥壳）
+function unwrapCdata(body) {
+  const m = body.match(/<!\[CDATA\[([\s\S]*?)\]\]>/);
+  return m ? m[1] : body;
+}
+
+function pickFormhash(rawHtml) {
+  // 原始 + 剥 CDATA + 反转义，三份一起找
+  const candidates = [
+    rawHtml,
+    unwrapCdata(rawHtml),
+    decodeEntities(unwrapCdata(rawHtml)),
+    decodeEntities(rawHtml),
   ];
-  for (const p of pats) {
-    const m = html.match(p);
-    if (m && m[1]) return m[1];
+  const pats = [
+    /name=["']?formhash["']?\s+value=["']([A-Za-z0-9]{4,16})["']/i,
+    /value=["']([A-Za-z0-9]{4,16})["']\s+name=["']?formhash["']?/i,
+    /name=["']?formhash["']?[^>]{0,40}?value=["']([A-Za-z0-9]{4,16})/i,
+    /formhash=([A-Za-z0-9]{8})/i,
+    /formhash["']?\s*[:=]\s*["']?([A-Za-z0-9]{4,16})/i,
+    /"formhash"\s*:\s*"([A-Za-z0-9]{4,16})"/i,
+  ];
+  for (const c of candidates) {
+    if (!c) continue;
+    for (const p of pats) {
+      const m = c.match(p);
+      if (m && m[1]) return m[1];
+    }
   }
   return null;
 }
 
-function pickLoginhash(html) {
-  const pats = [
-    /loginhash["']?\s*[:=]\s*["']?([A-Za-z0-9]{4,16})/,
-    /loginhash=([A-Za-z0-9]{4,8})/,
-    /action=login&loginhash=([A-Za-z0-9]+)/,
+function pickLoginhash(rawHtml) {
+  const candidates = [
+    rawHtml,
+    unwrapCdata(rawHtml),
+    decodeEntities(unwrapCdata(rawHtml)),
   ];
-  for (const p of pats) {
-    const m = html.match(p);
-    if (m && m[1]) return m[1];
+  const pats = [
+    /loginhash["']?\s*[:=]\s*["']?([A-Za-z0-9]{4,16})/i,
+    /loginhash=([A-Za-z0-9]{4,8})/i,
+    /action=login&loginhash=([A-Za-z0-9]+)/i,
+    /"loginhash"\s*:\s*"([A-Za-z0-9]{4,8})"/i,
+  ];
+  for (const c of candidates) {
+    if (!c) continue;
+    for (const p of pats) {
+      const m = c.match(p);
+      if (m && m[1]) return m[1];
+    }
   }
-  return '';
+  return '';  // loginhash 取不到也能登录，Discuz 多数情况不校验
 }
 
 function stripCdata(body) {
@@ -271,14 +312,37 @@ function maskUser(u) {
  */
 async function login(user, pwd) {
   // 1) 打开登录页（同样过 WAF），取 loginhash / formhash
-  const loginPage = '/member.php?mod=logging&action=login&infloat=yes&handlekey=login&inajax=1&ajaxtarget=fwin_content_login';
-  const lp = await getWithWaf(loginPage, '');
-  if (!lp) return { ok: false, msg: '登录页被 WAF 拦截' };
+  // 移动端 UA 下 Discuz 可能返回不同页，逐个候选页试，取到 formhash 就用
+  const LOGIN_PAGES = [
+    '/member.php?mod=logging&action=login&infloat=yes&handlekey=login&inajax=1&ajaxtarget=fwin_content_login',
+    '/member.php?mod=logging&action=login&infloat=yes&handlekey=login',
+    '/member.php?mod=logging&action=login',
+  ];
 
-  const formhash = pickFormhash(lp.res.body);
-  if (!formhash) return { ok: false, msg: '登录页未取到 formhash' };
-  const loginhash = pickLoginhash(lp.res.body);
-  console.log(`登录页: HTTP ${lp.res.status} ${lp.res.ms}ms | formhash=${formhash} loginhash=${loginhash || '-'}`);
+  let lp = null;
+  let formhash = null;
+  let loginhash = '';
+
+  for (const page of LOGIN_PAGES) {
+    const got = await getWithWaf(page, '');
+    if (!got) {
+      console.log(`登录页 ${page} -> 被 WAF 拦截`);
+      continue;
+    }
+    const fh = pickFormhash(got.res.body);
+    console.log(`登录页 ${page} -> HTTP ${got.res.status} ${got.res.ms}ms ${got.res.body.length}B formhash=${fh || '无'}`);
+    if (fh) {
+      lp = got;
+      formhash = fh;
+      loginhash = pickLoginhash(got.res.body);
+      break;
+    }
+    // 诊断：把没取到时的响应头部打出来，便于定位
+    console.log(`   └ 响应片段: ${stripCdata(got.res.body).slice(0, 160)}`);
+  }
+
+  if (!formhash) return { ok: false, msg: '登录页未取到 formhash（已试 3 个候选页）' };
+  console.log(`✅ 取到 formhash=${formhash} loginhash=${loginhash || '-'}`);
 
   // 2) 提交登录
   const loginUrl = `/member.php?mod=logging&action=login&loginsubmit=yes&handlekey=login&loginhash=${loginhash}&inajax=1`;
