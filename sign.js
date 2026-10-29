@@ -18,7 +18,7 @@
  *  - 单次请求超时 120s，自动重试 4 次（重试时轮换代理）
  *  - 整体最多 4 轮，间隔 30s / 60s / 120s
  *  - 密码错误即停，不做无意义重试
- *  - 定时触发随机延迟打散时间特征，手动触发跳过
+ *  - 默认跳过随机延迟立即签到（SKIP_DELAY=false 可恢复抖动）
  *
  * 配置（环境变量）：
  *  ACCOUNTS      - 每行 "用户名:密码"，必填（与 BBS_COOKIE 二选一）
@@ -749,8 +749,10 @@ async function main() {
   }
   console.log(directCookie ? '使用 BBS_COOKIE，跳过登录' : `共 ${accounts.length} 个账号`);
 
+  // 默认跳过随机延迟、立即签到。想恢复抖动就把 SKIP_DELAY 显式设成 false/0。
+  const skipDelay = !/^(false|0|no)$/i.test((process.env.SKIP_DELAY || '').trim());
   const eventName = process.env.GITHUB_EVENT_NAME || '';
-  if (eventName === 'schedule' && process.env.SKIP_DELAY !== '1') {
+  if (eventName === 'schedule' && !skipDelay) {
     const maxMin = Math.max(0, parseInt(process.env.MAX_DELAY_MIN || '15', 10) || 0);
     const delay = Math.floor(Math.random() * maxMin * 60 * 1000);
     console.log(`🎲 随机延迟 ${Math.round(delay / 60000)} 分钟后开始签到...`);
@@ -764,7 +766,7 @@ async function main() {
     }
     console.log('⏰ 延迟结束，开始签到！');
   } else {
-    console.log('🚀 手动触发，跳过随机延迟');
+    console.log('🚀 跳过随机延迟，立即签到');
   }
 
   const targets = directCookie

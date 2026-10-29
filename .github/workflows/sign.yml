@@ -10,11 +10,11 @@ on:
   workflow_dispatch:
     inputs:
       skip_delay:
-        description: '跳过随机延迟（立即签到）'
+        description: '跳过随机延迟（立即签到），默认开'
         type: boolean
         default: true
       use_warp:
-        description: '挂 Cloudflare WARP 换出口 IP（配了代理就关掉）'
+        description: '挂 Cloudflare WARP 换出口 IP'
         type: boolean
         default: true
       smoke:
@@ -42,10 +42,10 @@ jobs:
       with:
         node-version: '24'
 
-    # 配了 PROXIES / HTTPS_PROXY 就别挂 WARP 了，两者会打架。
-    # 关掉方式：仓库 Settings → Variables → USE_WARP = false
+    # 默认常开，把出口换成 Cloudflare 的 IP。
+    # 只在手动触发时把 use_warp 取消勾选才会跳过。
     - name: 挂 Cloudflare WARP 换出口 IP
-      if: ${{ vars.USE_WARP != 'false' && github.event.inputs.use_warp != 'false' }}
+      if: ${{ github.event.inputs.use_warp != 'false' }}
       continue-on-error: true
       timeout-minutes: 8
       run: |
@@ -84,7 +84,9 @@ jobs:
         MT_DEBUG: ${{ vars.MT_DEBUG }}
         MT_SMOKE: ${{ github.event.inputs.smoke == true && '1' || '' }}
         GITHUB_EVENT_NAME: ${{ github.event_name }}
-        SKIP_DELAY: ${{ github.event.inputs.skip_delay == 'true' && '1' || '' }}
+        # 默认跳过随机延迟、立即签到（定时触发也一样）。
+        # 想恢复随机延迟：手动触发时把 skip_delay 取消勾选。
+        SKIP_DELAY: ${{ github.event.inputs.skip_delay == 'false' && '' || '1' }}
         MAX_DELAY_MIN: ${{ env.MAX_DELAY_MIN }}
       run: |
         node -v

@@ -8,13 +8,13 @@ on:
   workflow_dispatch:
     inputs:
       retain_days:
-        description: '保留最近多少天的运行记录（更早的删除）'
+        description: '额外保留最近多少天的记录（0 = 只看条数，不看时间）'
         type: string
-        default: '7'
+        default: '0'
       keep_runs:
-        description: '每个 workflow 至少保留几条运行记录'
+        description: '每个 workflow 保留最新几条运行记录'
         type: string
-        default: '3'
+        default: '1'
       keep_caches:
         description: '保留最近使用的几个缓存（0 = 全删）'
         type: string
@@ -40,8 +40,10 @@ jobs:
     timeout-minutes: 30
 
     env:
-      RETAIN_DAYS: '7'
-      KEEP_RUNS: '3'
+      # 0 = 不按时间保留，纯按条数
+      RETAIN_DAYS: '0'
+      # 每个 workflow 只留最新 1 条运行记录
+      KEEP_RUNS: '1'
       KEEP_CACHES: '1'
 
     steps:
@@ -68,57 +70,82 @@ jobs:
       run: |
         set +e
         SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/null}"
-        R="${IN_RETAIN:-${RETAIN_DAYS}}"; R="${R:-7}"
-        K="${IN_KEEP:-${KEEP_RUNS}}"; K="${K:-3}"
-        echo "策略：保留最近 ${R} 天，且每个 workflow 至少留 ${K} 条"
+        R="${IN_RETAIN:-${RETAIN_DAYS}}"; R="${R:-0}"
+        K="${IN_KEEP:-${KEEP_RUNS}}"; K="${K:-1}"
 
-        CUTOFF=$(date -u -d "${R} days ago" +%Y-%m-%d)
-        echo "截止日期: ${CUTOFF}"
+        if [ "${R}" -gt 0 ] 2>/dev/null; then
+          CUTOFF=$(date -u -d "${R} days ago" +%Y-%m-%d)
+        else
+          CUTOFF=""
+        fi
+        echo "策略：每个 workflow 保留最新 ${K} 条${CUTOFF:+，且保留 ${CUTOFF} 之后的记录}"
+        echo "保底条数 K=${K}  额外时间窗口=${CUTOFF:-不限}"
 
-        # 只拉「已完成」且「早于截止日」的记录，量小很多
-        # URL 里的 < 必须编码成 %3C
-        gh api --paginate \
-          "repos/${GITHUB_REPOSITORY}/actions/runs?per_page=100&status=completed&created=%3C${CUTOFF}" \
-          --jq '.workflow_runs[] | "\(.id) \(.created_at)"' > /tmp/runs.txt 2>/tmp/runs.err
+        # 拉取运行记录。API 默认按创建时间倒序，所以「前 K 条」就是最新的 K 条。
+        # 不再按 created 过滤：要按条数保留就得先看到全部，否则算不准「最新 K 条」。
+        # workflow_id 个别老记录可能缺失，用 workflow 名兜底分组。
+        gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs?per_page=100" \
+          --jq '.workflow_runs[] | "\(.id)\t\(.workflow_id // .name)\t\(.created_at)"' \
+          > /tmp/runs.tsv 2>/tmp/runs.err
         if [ $? -ne 0 ]; then
           echo "::warning::拉取运行记录失败"
           cat /tmp/runs.err
-          : > /tmp/runs.txt
+          : > /tmp/runs.tsv
         fi
 
-        # 用 wc -l 而非 grep -c：空文件下 grep 返回 1，
-        # 配合 || echo 0 会输出两行，写进 GITHUB_OUTPUT 是非法格式
-        TOTAL=$(wc -l < /tmp/runs.txt | tr -d ' ' || true)
+        TOTAL=$(wc -l < /tmp/runs.tsv | tr -d ' ' || true)
         TOTAL="${TOTAL:-0}"
-        echo "符合删除条件: ${TOTAL} 条"
+        echo "当前运行记录: ${TOTAL} 条"
 
-        # 每个 workflow 的保底条数：从最新记录里数，够 K 条才允许删
-        # 这里简化为总量保底：不足 K 条时一条都不删
-        if [ "${TOTAL}" -le "${K}" ]; then
-          echo "总数 ${TOTAL} 未超过保底 ${K}，跳过删除"
+        if [ "${TOTAL}" -eq 0 ]; then
+          echo "没有运行记录，无需清理"
+          echo "- 运行记录：0 条，无需清理" >> "${SUMMARY}"
+          exit 0
+        fi
+
+        # 按 workflow 分组，每组跳过最新 K 条；开了时间窗口的，窗口内的也跳过
+        awk -F'\t' -v k="${K}" -v cutoff="${CUTOFF}" '
+          { c[$2]++
+            if (c[$2] <= k) next
+            if (cutoff != "" && $3 >= cutoff) next
+            print $1 "\t" $3 }
+        ' /tmp/runs.tsv > /tmp/to_delete_runs.tsv
+
+        DEL=$(wc -l < /tmp/to_delete_runs.tsv | tr -d ' ' || true)
+        DEL="${DEL:-0}"
+        echo "待删除: ${DEL} 条（保留 ${TOTAL} 中的最新 ${K} 条/组）"
+
+        if [ "${IN_DRY}" = "true" ]; then
+          echo "演练模式：跳过删除"
+          echo "- 运行记录：演练，待删 ${DEL} 条" >> "${SUMMARY}"
+          exit 0
+        fi
+
+        if [ "${DEL}" -eq 0 ]; then
           echo "- 运行记录：无需清理（${TOTAL} 条）" >> "${SUMMARY}"
           exit 0
         fi
 
-        if [ "${IN_DRY}" = "true" ]; then
-          echo "演练模式：跳过删除"
-          echo "- 运行记录：演练，待删 ${TOTAL} 条" >> "${SUMMARY}"
-          exit 0
-        fi
-
-        OK=0; FAIL=0
-        while read -r id created; do
+        OK=0; FAIL=0; BUSY=0
+        while IFS=$'\t' read -r id created; do
           [ -n "${id:-}" ] || continue
-          if gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/runs/${id}" >/dev/null 2>&1; then
-            OK=$(( OK + 1 ))
-          else
-            FAIL=$(( FAIL + 1 ))
-            echo "  ❌ run ${id}（${created}）删除失败"
-          fi
-        done < /tmp/runs.txt
+          out=$(gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/runs/${id}" -i 2>&1)
+          case "$(printf '%s' "${out}" | head -n1)" in
+            *204*|*200*)
+              OK=$(( OK + 1 )) ;;
+            *400*|*409*)
+              # 正在运行 / 被占用，删不掉是正常的，下轮再清
+              BUSY=$(( BUSY + 1 )) ;;
+            *404*)
+              OK=$(( OK + 1 )) ;;
+            *)
+              FAIL=$(( FAIL + 1 ))
+              echo "  ❌ run ${id}（${created}）→ $(printf '%s' "${out}" | head -n1)" ;;
+          esac
+        done < /tmp/to_delete_runs.tsv
 
-        echo "运行记录：删除成功 ${OK} 条，失败 ${FAIL} 条"
-        echo "- 运行记录：删除 ${OK} 条，失败 ${FAIL} 条" >> "${SUMMARY}"
+        echo "运行记录：删除成功 ${OK} 条，占用跳过 ${BUSY} 条，失败 ${FAIL} 条"
+        echo "- 运行记录：删除 ${OK} 条，占用跳过 ${BUSY} 条，失败 ${FAIL} 条" >> "${SUMMARY}"
         # 一条都没删掉，几乎必是权限问题
         if [ "${FAIL}" -gt 0 ] && [ "${OK}" -eq 0 ]; then
           echo "::error::全部删除失败 —— 检查 Settings → Actions → General → Workflow permissions 是否为 Read and write"
