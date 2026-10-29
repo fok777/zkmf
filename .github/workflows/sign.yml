@@ -13,19 +13,26 @@ on:
         description: '跳过随机延迟（立即签到）'
         type: boolean
         default: true
+      use_warp:
+        description: '挂 Cloudflare WARP 换出口 IP（配了代理就关掉）'
+        type: boolean
+        default: true
+      smoke:
+        description: '只做连通性自检，不签到（排查 WAF/代理用）'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+  actions: write
 
 env:
-  # 定时触发的随机延迟上限（分钟）。GitHub 的 schedule 本身会晚 5~30 分钟，
-  # 再加一点点抖动就够打散特征了，别设太大，否则会撞上 job 超时
+  # 定时触发的随机延迟上限（分钟）
   MAX_DELAY_MIN: '15'
 
 jobs:
   sign:
     runs-on: ubuntu-26.04
-    # WARP 安装最多 8 分钟 + 延迟 15 分钟 + 777 原版重试（单请求 120s × 4 次 × 整体 4 轮）
     timeout-minutes: 60
 
     steps:
@@ -35,10 +42,10 @@ jobs:
       with:
         node-version: '24'
 
-    # GitHub Runner 所在的 Azure 段到 bbs.binmt.cc 会 SYN 丢包（约 5s 超时），
-    # 直连必失败。挂 WARP 把出口换成 Cloudflare 的 IP。
-    # 只用 jammy 源（Cloudflare 官方最全），避免逐个试源拖时间。
+    # 配了 PROXIES / HTTPS_PROXY 就别挂 WARP 了，两者会打架。
+    # 关掉方式：仓库 Settings → Variables → USE_WARP = false
     - name: 挂 Cloudflare WARP 换出口 IP
+      if: ${{ vars.USE_WARP != 'false' && github.event.inputs.use_warp != 'false' }}
       continue-on-error: true
       timeout-minutes: 8
       run: |
@@ -70,6 +77,12 @@ jobs:
       continue-on-error: true
       env:
         ACCOUNTS: ${{ secrets.ACCOUNTS }}
+        BBS_COOKIE: ${{ secrets.BBS_COOKIE }}
+        # 代理池：每行一个，如 http://user:pass@1.2.3.4:8080，失败自动轮换
+        PROXIES: ${{ secrets.PROXIES }}
+        HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
+        MT_DEBUG: ${{ vars.MT_DEBUG }}
+        MT_SMOKE: ${{ github.event.inputs.smoke == true && '1' || '' }}
         GITHUB_EVENT_NAME: ${{ github.event_name }}
         SKIP_DELAY: ${{ github.event.inputs.skip_delay == 'true' && '1' || '' }}
         MAX_DELAY_MIN: ${{ env.MAX_DELAY_MIN }}
@@ -82,7 +95,7 @@ jobs:
       run: |
         SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/null}"
         LOG=/tmp/sign.log
-        if grep -qE '全部账号签到完成|✅ 签到完成|签到完成:' "${LOG}" 2>/dev/null; then
+        if grep -qE '全部账号签到完成' "${LOG}" 2>/dev/null; then
           echo "## ✅ 签到成功" >> "${SUMMARY}"
           exit 0
         fi
@@ -91,12 +104,14 @@ jobs:
           REASON="脚本未产生日志，可能超时被杀"
         elif grep -qE '账号或密码有误|密码错误|用户名.*不正确' "${LOG}"; then
           REASON="账号或密码有误 —— 去 Settings → Secrets → ACCOUNTS 核对"
-        elif grep -qE '被 WAF 拦截|acw_sc__v2' "${LOG}"; then
-          REASON="被阿里云 ESA 挑战挡住，acw_sc__v2 未还原"
-        elif grep -qE 'timeout|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|socket hang' "${LOG}"; then
-          REASON="网络超时 —— 出口 IP 到目标站不通（WARP 也没绕过去）"
-        elif grep -qE '登录未确认|会话失效|未能从签到页取到 formhash' "${LOG}"; then
-          REASON="登录成功但签到未确认 —— Cookie 未生效或站点改了返回格式"
+        elif grep -qE '未取到 formhash（已试 3 个候选页' "${LOG}"; then
+          REASON="登录页拿不到 formhash —— 拿到的一直是 WAF 挑战页，多半要挂国内代理"
+        elif grep -qE '多次请求仍被 WAF 拦截|没解出来' "${LOG}"; then
+          REASON="被阿里云 ESA 挑战挡住，acw_sc__v2 没解出来 —— 下载 debug 快照看挑战页长什么样"
+        elif grep -qE 'timeout|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|socket hang|CONNECT' "${LOG}"; then
+          REASON="网络/代理不通 —— 检查 PROXIES 里的代理是否还活着"
+        elif grep -qE '未能从签到页取到 formhash' "${LOG}"; then
+          REASON="登录成功但签到页没 formhash —— Cookie 没生效或站点改版"
         elif grep -qE '缺少环境变量 ACCOUNTS' "${LOG}"; then
           REASON="Secret ACCOUNTS 未设置"
         else
@@ -112,8 +127,18 @@ jobs:
           echo "<details><summary>日志尾部</summary>"
           echo
           echo '```'
-          tail -30 "${LOG}" 2>/dev/null
+          tail -40 "${LOG}" 2>/dev/null
           echo '```'
           echo
           echo "</details>"
         } >> "${SUMMARY}"
+
+    # 每次响应都会存一份到 debug/，排查 WAF 时把它下载下来直接看
+    - name: 上传调试快照
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: sign-debug-${{ github.run_number }}
+        path: debug/*.html
+        if-no-files-found: ignore
+        retention-days: 3
